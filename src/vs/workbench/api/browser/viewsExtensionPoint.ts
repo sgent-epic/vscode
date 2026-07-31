@@ -21,7 +21,7 @@ import { PaneCompositeRegistry, Extensions as ViewletExtensions } from '../../br
 import { CustomTreeView, TreeViewPane } from '../../browser/parts/views/treeView.js';
 import { ViewPaneContainer } from '../../browser/parts/views/viewPaneContainer.js';
 import { IWorkbenchContribution, WorkbenchPhase, registerWorkbenchContribution2 } from '../../common/contributions.js';
-import { ICustomViewDescriptor, IViewContainersRegistry, IViewDescriptor, IViewsRegistry, ViewContainer, Extensions as ViewContainerExtensions, ViewContainerLocation } from '../../common/views.js';
+import { ICustomViewDescriptor, IViewContainersRegistry, IViewDescriptor, IViewsRegistry, ViewContainer, Extensions as ViewContainerExtensions, ViewContainerLocation, WindowEnablement } from '../../common/views.js';
 import { VIEWLET_ID as DEBUG } from '../../contrib/debug/common/debug.js';
 import { VIEWLET_ID as EXPLORER } from '../../contrib/files/common/files.js';
 import { VIEWLET_ID as REMOTE } from '../../contrib/remote/browser/remoteExplorer.js';
@@ -274,7 +274,7 @@ const viewsExtensionPoint: IExtensionPoint<ViewExtensionPointType> = ExtensionsR
 
 const CUSTOM_VIEWS_START_ORDER = 7;
 
-class ViewsExtensionHandler implements IWorkbenchContribution {
+export class ViewsExtensionHandler extends Disposable implements IWorkbenchContribution {
 
 	static readonly ID = 'workbench.contrib.viewsExtensionHandler';
 
@@ -285,6 +285,7 @@ class ViewsExtensionHandler implements IWorkbenchContribution {
 		@IInstantiationService private readonly instantiationService: IInstantiationService,
 		@ILogService private readonly logService: ILogService
 	) {
+		super();
 		this.viewContainersRegistry = Registry.as<IViewContainersRegistry>(ViewContainerExtensions.ViewContainersRegistry);
 		this.viewsRegistry = Registry.as<IViewsRegistry>(ViewContainerExtensions.ViewsRegistry);
 		this.handleAndRegisterCustomViewContainers();
@@ -292,14 +293,14 @@ class ViewsExtensionHandler implements IWorkbenchContribution {
 	}
 
 	private handleAndRegisterCustomViewContainers() {
-		viewsContainersExtensionPoint.setHandler((extensions, { added, removed }) => {
+		this._register(viewsContainersExtensionPoint.setHandler((extensions, { added, removed }) => {
 			if (removed.length) {
 				this.removeCustomViewContainers(removed);
 			}
 			if (added.length) {
 				this.addCustomViewContainers(added, this.viewContainersRegistry.all);
 			}
-		});
+		}));
 	}
 
 	private addCustomViewContainers(extensionPoints: readonly IExtensionPointUser<ViewContainerExtensionPointType>[], existingViewContainers: ViewContainer[]): void {
@@ -416,6 +417,7 @@ class ViewsExtensionHandler implements IWorkbenchContribution {
 				hideIfEmpty: true,
 				order,
 				icon,
+				windowEnablement: WindowEnablement.Both,
 			}, location);
 
 		}
@@ -429,14 +431,14 @@ class ViewsExtensionHandler implements IWorkbenchContribution {
 	}
 
 	private handleAndRegisterCustomViews() {
-		viewsExtensionPoint.setHandler((extensions, { added, removed }) => {
+		this._register(viewsExtensionPoint.setHandler((extensions, { added, removed }) => {
 			if (removed.length) {
 				this.removeViews(removed);
 			}
 			if (added.length) {
 				this.addViews(added);
 			}
-		});
+		}));
 	}
 
 	private addViews(extensions: readonly IExtensionPointUser<ViewExtensionPointType>[]): void {
@@ -535,7 +537,8 @@ class ViewsExtensionHandler implements IWorkbenchContribution {
 						hideByDefault: initialVisibility === InitialVisibility.Hidden,
 						workspace: viewContainer?.id === REMOTE ? true : undefined,
 						weight,
-						accessibilityHelpContent
+						accessibilityHelpContent,
+						windowEnablement: WindowEnablement.Both
 					};
 
 
