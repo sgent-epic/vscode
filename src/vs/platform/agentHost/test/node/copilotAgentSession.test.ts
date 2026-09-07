@@ -69,7 +69,8 @@ import { AgentHostSandboxConfigKey, AgentHostSandboxKey } from '../../common/san
 import { AgentSandboxEnabledValue } from '../../../sandbox/common/settings.js';
 import { createNoopGitService, createSessionDataService, createZeroDiffComputeService, TestSessionDatabase } from '../common/sessionTestHelpers.js';
 import { OtelData } from '../../common/otlp/otlpLogEmitter.js';
-import { type IAgentServerToolDefinition, IAgentServerToolHost } from '../../common/agentServerTools.js';
+import { type IAgentServerToolDefinition, IAgentServerToolHost, type IAgentServerToolInvocation } from '../../common/agentServerTools.js';
+import { AgentServerToolHost, type IServerToolExecutionContext } from '../../node/shared/agentServerToolHost.js';
 import { SessionServerToolName } from '../../common/serverToolNames.js';
 import { IAgentHostGitService } from '../../common/agentHostGitService.js';
 import { ICopilotApiService, type ICopilotApiServiceRequestOptions, type ICopilotUtilityChatCompletionRequest, type IRestrictedTelemetryContext } from '../../node/shared/copilotApiService.js';
@@ -10991,7 +10992,7 @@ Use the attached image as context.
 		class FakeServerToolHost implements IAgentServerToolHost {
 			readonly toolNames: readonly string[];
 			readonly advertised: string[] = [];
-			readonly executions: Array<{ sessionUri: string; toolName: string; rawArgs: unknown }> = [];
+			readonly executions: Array<{ sessionUri: string; toolName: string; rawArgs: unknown; invocation?: IAgentServerToolInvocation }> = [];
 			readonly confirmationToolNames = new Set<string>();
 			readonly sessionConfirmationToolNames = new Set<string>();
 			result = 'ok';
@@ -11011,8 +11012,8 @@ Use the attached image as context.
 
 			requiresConfirmation(_sessionUri: string, toolName: string): boolean { return this.sessionConfirmationToolNames.has(toolName); }
 
-			executeTool(sessionUri: string, toolName: string, rawArgs: unknown): string {
-				this.executions.push({ sessionUri, toolName, rawArgs });
+			executeTool(sessionUri: string, toolName: string, rawArgs: unknown, invocation?: IAgentServerToolInvocation): string {
+				this.executions.push({ sessionUri, toolName, rawArgs, ...(invocation ? { invocation } : {}) });
 				if (this.error) {
 					throw this.error;
 				}
@@ -11055,9 +11056,72 @@ Use the attached image as context.
 			const result = await invokeClientToolHandler(tools[0], 'tc-server-tool', { foo: 'bar' });
 
 			const sessionUri = buildDefaultChatUri(AgentSession.uri('copilot', 'test-session-1'));
-			assert.deepStrictEqual(serverToolHost.executions, [{ sessionUri, toolName: tools[0].name, rawArgs: { foo: 'bar' } }]);
+			assert.deepStrictEqual(serverToolHost.executions, [{
+				sessionUri, toolName: tools[0].name, rawArgs: { foo: 'bar' },
+				invocation: { toolCallId: 'tc-server-tool', toolName: tools[0].name },
+			}]);
 			assert.strictEqual(result.resultType, 'success');
 			assert.strictEqual(result.textResultForLlm, 'listed 2 comments');
+		});
+
+		test('the first user request exposes server tools and verifies its native callback after tool start', async () => {
+			const manager = disposables.add(new AgentHostStateManager(new NullLogService()));
+			const sessionUri = AgentSession.uri('copilot', 'test-session-1').toString();
+			const chatUri = buildDefaultChatUri(sessionUri);
+			manager.createSession({
+				resource: sessionUri, provider: 'copilot', title: 'First request', status: SessionStatus.Idle,
+				createdAt: '2026-09-06T00:00:00Z', modifiedAt: '2026-09-06T00:00:00Z',
+			});
+			const receipts: Array<IServerToolExecutionContext['invocation']> = [];
+			const serverToolHost = new AgentServerToolHost(manager, [{
+				definitions: [fakeToolDefinitions[0]],
+				isEnabled: () => true,
+				isEnabledForSession: () => true,
+				execute: (_state, context) => { receipts.push(context.invocation); return 'first reply'; },
+			}]);
+			const { session, runtime, mockSession, signals } = await createAgentSession(disposables, { serverToolHost });
+			const tools = runtime.createServerSdkTools();
+			manager.dispatchServerAction(chatUri, {
+				type: ActionType.ChatTurnStarted, turnId: 'first-turn', startedAt: '2026-09-06T00:00:00Z',
+				message: { text: 'Initial work', origin: { kind: MessageKind.User } },
+			});
+			await session.send('Initial work', undefined, 'first-turn');
+			mockSession.fire('tool.execution_start', {
+				toolCallId: 'native-first-call', toolName: tools[0].name, arguments: {},
+			} as SessionEventPayload<'tool.execution_start'>['data']);
+			for (const signal of signals) {
+				if (signal.kind === 'action') {
+					manager.dispatchServerAction(signal.resource.toString(), signal.action);
+				}
+			}
+			const result = await invokeClientToolHandler(tools[0], 'native-first-call', { toolCallId: 'forged' });
+
+			assert.deepStrictEqual({
+				firstTools: tools.map(tool => ({ name: tool.name, defer: tool.defer })),
+				userRequests: mockSession.sendRequests.length,
+				turnsCompleted: manager.getChatState(chatUri)?.turns.length,
+				receipts,
+				result: result.textResultForLlm,
+			}, {
+				firstTools: [{ name: 'serverToolA', defer: 'never' }],
+				userRequests: 1,
+				turnsCompleted: 0,
+				receipts: [{ toolCallId: 'native-first-call', turnId: 'first-turn' }],
+				result: 'first reply',
+			});
+		});
+
+		test('does not attach callback identity from another SDK session or tool name', async () => {
+			const serverToolHost = new FakeServerToolHost();
+			const { runtime } = await createAgentSession(disposables, { serverToolHost });
+			const tool = runtime.createServerSdkTools()[0];
+			for (const invocation of [
+				{ sessionId: 'foreign-session', toolName: tool.name },
+				{ sessionId: 'test-session-1', toolName: 'foreign-tool' },
+			]) {
+				await tool.handler!({}, { ...invocation, toolCallId: 'native-call', arguments: {} });
+			}
+			assert.deepStrictEqual(serverToolHost.executions.map(call => call.invocation), [undefined, undefined]);
 		});
 
 		test('server tool handler surfaces host failures as a failure result', async () => {

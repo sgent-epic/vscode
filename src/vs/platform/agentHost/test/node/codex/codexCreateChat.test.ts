@@ -23,7 +23,7 @@ import { AgentSession, type AgentSignal, type IAgentChatContext, type IAgentCrea
 import { buildChatUri, buildDefaultChatUri } from '../../../common/state/sessionState.js';
 import { ActionType } from '../../../common/state/sessionActions.js';
 import { CustomizationType, McpServerStatus } from '../../../common/state/protocol/channels-session/state.js';
-import type { IAgentServerToolHost } from '../../../common/agentServerTools.js';
+import type { IAgentServerToolHost, IAgentServerToolInvocation } from '../../../common/agentServerTools.js';
 import { ISessionDataService, type ISessionDatabase } from '../../../common/sessionDataService.js';
 import { IAgentHostCheckpointService, NULL_CHECKPOINT_SERVICE } from '../../../common/agentHostCheckpointService.js';
 import { IAgentHostOTelService } from '../../../common/otel/agentHostOTelService.js';
@@ -286,7 +286,7 @@ const PEER_TEST_TOOL_NAME = 'peer_test_tool';
  * Records the exact chat channel Codex hands the server-tool host for a single
  * server tool ({@link PEER_TEST_TOOL_NAME}).
  */
-function createRecordingChatServerToolHost(calls: { readonly method: 'requiresConfirmation' | 'executeTool'; readonly chatUri: string }[]): IAgentServerToolHost {
+function createRecordingChatServerToolHost(calls: { readonly method: 'requiresConfirmation' | 'executeTool'; readonly chatUri: string; readonly invocation?: IAgentServerToolInvocation }[]): IAgentServerToolHost {
 	return {
 		definitions: [{ name: PEER_TEST_TOOL_NAME, description: 'test', inputSchema: { type: 'object' } }],
 		toolNames: [PEER_TEST_TOOL_NAME],
@@ -297,8 +297,8 @@ function createRecordingChatServerToolHost(calls: { readonly method: 'requiresCo
 			calls.push({ method: 'requiresConfirmation', chatUri: chatUri.toString() });
 			return false;
 		},
-		executeTool: (chatUri, _toolName, _rawArgs) => {
-			calls.push({ method: 'executeTool', chatUri: chatUri.toString() });
+		executeTool: (chatUri, _toolName, _rawArgs, invocation) => {
+			calls.push({ method: 'executeTool', chatUri: chatUri.toString(), ...(invocation ? { invocation } : {}) });
 			return 'tool result';
 		},
 	};
@@ -2073,7 +2073,7 @@ suite('CodexAgent exact chat routing', () => {
 
 	test('a peer chat\'s server-tool call uses its exact Agent Host chat channel', async () => {
 		const agent = await createAgent(disposables, { sdkResolvableWithoutDownload: true });
-		const calls: { readonly method: 'requiresConfirmation' | 'executeTool'; readonly chatUri: string }[] = [];
+		const calls: { readonly method: 'requiresConfirmation' | 'executeTool'; readonly chatUri: string; readonly invocation?: IAgentServerToolInvocation }[] = [];
 		agent.setServerToolHost(createRecordingChatServerToolHost(calls));
 		const peer = disposables.add(createTestPeer());
 		connectPeer(agent, peer);
@@ -2117,9 +2117,19 @@ suite('CodexAgent exact chat routing', () => {
 				params: { threadId: 'peer-thread', turnId: 'turn-irrelevant', callId: 'call-1', namespace: null, tool: PEER_TEST_TOOL_NAME, arguments: {} },
 			});
 			const response = await responding;
+			peerEntry.mapState.itemToToolCall.set('mapped-call', {
+				toolCallId: 'host-call', turnId: 'first-turn', toolName: PEER_TEST_TOOL_NAME, output: '',
+			});
+			const mappedResponse = readNextMessage(peer.outbound);
+			peer.push({
+				id: 9002, method: 'item/tool/call',
+				params: { threadId: 'peer-thread', turnId: 'first-turn', callId: 'mapped-call', namespace: null, tool: PEER_TEST_TOOL_NAME, arguments: { toolCallId: 'forged' } },
+			});
+			await mappedResponse;
 
 			assert.deepStrictEqual({
 				peerRuntimeUri: peerEntry.sessionUri.toString(),
+				initialThreadTools: peerStart.params.dynamicTools,
 				calls,
 				toolSucceeded: response.result?.success,
 			}, {
@@ -2127,9 +2137,14 @@ suite('CodexAgent exact chat routing', () => {
 				// `codex:/<threadId>` identity — neither the addressed AH
 				// session nor the chat channel — must never reach the host.
 				peerRuntimeUri: AgentSession.uri('codex', 'peer-thread').toString(),
+				initialThreadTools: [{
+					type: 'function', name: PEER_TEST_TOOL_NAME, description: 'test', inputSchema: { type: 'object' },
+				}],
 				calls: [
 					{ method: 'requiresConfirmation', chatUri: peerChat.toString() },
 					{ method: 'executeTool', chatUri: peerChat.toString() },
+					{ method: 'requiresConfirmation', chatUri: peerChat.toString() },
+					{ method: 'executeTool', chatUri: peerChat.toString(), invocation: { toolCallId: 'host-call', toolName: PEER_TEST_TOOL_NAME } },
 				],
 				toolSucceeded: true,
 			});

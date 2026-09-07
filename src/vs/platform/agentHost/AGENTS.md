@@ -240,6 +240,16 @@ For every provider, migration and discovery partition the same native catalog: m
 
 ### Server-tool creation provenance
 
+Server-tool providers may attach an exact SDK tool-call ID and native tool
+name to `IAgentServerToolHost.executeTool`. These fields come from the native
+callback, never the model's arguments. The host only produces a trusted
+`IServerToolExecutionContext.invocation` when the addressed chat's active turn
+contains one matching running call. It copies the call and turn IDs before
+execution. Missing, mismatched, duplicate or stale identity produces no
+invocation receipt. Existing tools keep their legacy execution behavior.
+Tools that require authenticated invocation identity must reject its absence.
+This does not qualify subagent sender routing or establish an incarnation ID.
+
 Treat a session as the user-visible unit of work. `create_session` requires a
 relationship: `currentSession` creates a peer chat for tasks in the current plan
 or deliverable, sharing its workspace, lifecycle, and aggregate diff;

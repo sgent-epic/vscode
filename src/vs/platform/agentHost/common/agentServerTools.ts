@@ -3,7 +3,13 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import type { ToolDefinition, URI } from './state/sessionState.js';
+import type { ToolCallState, ToolDefinition, URI } from './state/sessionState.js';
+
+/**
+ * Exact SDK callback identity, supplied by the provider rather than tool arguments.
+ * The tool name retains the provider's transport spelling for matching host state.
+ */
+export type IAgentServerToolInvocation = Readonly<Pick<ToolCallState, 'toolCallId' | 'toolName'>>;
 
 /**
  * A server tool definition plus agent-host-local metadata that is not part of
@@ -69,5 +75,5 @@ export interface IAgentServerToolHost {
 	 * @throws if {@link toolName} is not a known server tool or the arguments
 	 * are invalid.
 	 */
-	executeTool(chatUri: URI, toolName: string, rawArgs: unknown): string | Promise<string>;
+	executeTool(chatUri: URI, toolName: string, rawArgs: unknown, invocation?: IAgentServerToolInvocation): string | Promise<string>;
 }

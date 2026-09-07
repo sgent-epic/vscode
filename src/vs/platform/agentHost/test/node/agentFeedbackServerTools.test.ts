@@ -4,15 +4,16 @@
  *--------------------------------------------------------------------------------------------*/
 
 import assert from 'assert';
+import { DeferredPromise } from '../../../../base/common/async.js';
 import { DisposableStore } from '../../../../base/common/lifecycle.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import { NullLogService } from '../../../log/common/log.js';
 import { feedbackAnnotationEntryMeta, FEEDBACK_ANNOTATION_META_KEY, readFeedbackAnnotationEntryAuthor, type IFeedbackAnnotationMeta } from '../../common/meta/agentFeedbackAnnotations.js';
 import { ActionType } from '../../common/state/protocol/common/actions.js';
-import { Annotation, AnnotationsState, SessionStatus, SessionSummary, buildChatUri, buildDefaultChatUri } from '../../common/state/sessionState.js';
+import { Annotation, AnnotationsState, MessageKind, SessionStatus, SessionSummary, ToolCallConfirmationReason, buildChatUri, buildDefaultChatUri } from '../../common/state/sessionState.js';
 import { buildAnnotationsUri } from '../../common/annotationsUri.js';
 import { AgentHostStateManager } from '../../node/agentHostStateManager.js';
-import { AgentServerToolHost } from '../../node/shared/agentServerToolHost.js';
+import { AgentServerToolHost, type IServerToolExecutionContext } from '../../node/shared/agentServerToolHost.js';
 import {
 	addCommentToolName,
 	applyFeedbackTool,
@@ -384,6 +385,103 @@ suite('AgentFeedbackServerTools', () => {
 		});
 
 		teardown(() => disposables.dispose());
+
+		function startNativeTool(chatUri: string, turnId: string, toolCallId: string, toolName = 'receipt_tool'): void {
+			manager.dispatchServerAction(chatUri, {
+				type: ActionType.ChatTurnStarted, turnId, startedAt: '2026-09-06T00:00:00Z',
+				message: { text: 'Initial work', origin: { kind: MessageKind.User } },
+			});
+			manager.dispatchServerAction(chatUri, {
+				type: ActionType.ChatToolCallStart, turnId, toolCallId, toolName, displayName: toolName,
+			});
+			manager.dispatchServerAction(chatUri, {
+				type: ActionType.ChatToolCallReady, turnId, toolCallId, invocationMessage: 'Running',
+				confirmed: ToolCallConfirmationReason.NotNeeded,
+			});
+		}
+
+		function receiptHost(execute: (context: IServerToolExecutionContext) => string | Promise<string>): AgentServerToolHost {
+			return new AgentServerToolHost(manager, [{
+				definitions: [{ name: 'receipt_tool' }],
+				legacyToolNames: new Map([['legacy_receipt_tool', 'receipt_tool']]),
+				isEnabled: () => true,
+				isEnabledForSession: () => true,
+				execute: (_state, context) => execute(context),
+			}]);
+		}
+
+		test('captures the first native invocation before awaiting a later turn', async () => {
+			manager.createSession(makeSummary());
+			const chatUri = buildDefaultChatUri(sessionResource);
+			const resume = new DeferredPromise<void>();
+			const executingHost = receiptHost(async context => {
+				await resume.p;
+				return JSON.stringify(context);
+			});
+			executingHost.advertise(sessionResource);
+			startNativeTool(chatUri, 'first-turn', 'first-call');
+
+			const result = executingHost.executeTool(chatUri, 'receipt_tool', {
+				chatUri: buildChatUri(sessionResource, 'forged'), turnId: 'forged', toolCallId: 'forged',
+			}, { toolCallId: 'first-call', toolName: 'receipt_tool' });
+			manager.dispatchServerAction(chatUri, { type: ActionType.ChatTurnComplete, turnId: 'first-turn', duration: 1 });
+			startNativeTool(chatUri, 'later-turn', 'later-call');
+			resume.complete();
+
+			assert.deepStrictEqual({
+				context: JSON.parse(await result),
+				currentTurn: manager.getChatState(chatUri)?.activeTurn?.id,
+			}, {
+				context: {
+					sessionUri: sessionResource, chatUri, turnId: 'first-turn',
+					invocation: { turnId: 'first-turn', toolCallId: 'first-call' },
+				},
+				currentTurn: 'later-turn',
+			});
+		});
+
+		test('never grants a receipt for missing, mismatched, sibling or completed calls', () => {
+			manager.createSession(makeSummary());
+			const chatUri = buildDefaultChatUri(sessionResource);
+			const sibling = buildChatUri(sessionResource, 'sibling');
+			manager.addChat(sessionResource, sibling);
+			startNativeTool(chatUri, 'first-turn', 'first-call');
+			startNativeTool(sibling, 'sibling-turn', 'sibling-call');
+			const contexts: Array<IServerToolExecutionContext['invocation']> = [];
+			const executingHost = receiptHost(context => { contexts.push(context.invocation); return 'legacy result'; });
+			const source = { toolCallId: 'first-call', toolName: 'receipt_tool' };
+
+			executingHost.executeTool(chatUri, 'receipt_tool', { toolCallId: 'first-call' });
+			executingHost.executeTool(chatUri, 'receipt_tool', {}, { ...source, toolCallId: '' });
+			executingHost.executeTool(chatUri, 'receipt_tool', {}, { ...source, toolCallId: 'unknown' });
+			executingHost.executeTool(chatUri, 'receipt_tool', {}, { ...source, toolName: 'wrong_tool' });
+			executingHost.executeTool(sibling, 'receipt_tool', {}, source);
+			manager.dispatchServerAction(chatUri, {
+				type: ActionType.ChatToolCallComplete, turnId: 'first-turn', toolCallId: 'first-call',
+				result: { success: true, pastTenseMessage: 'Completed' },
+			});
+			executingHost.executeTool(chatUri, 'receipt_tool', {}, source);
+			manager.dispatchServerAction(chatUri, { type: ActionType.ChatTurnComplete, turnId: 'first-turn', duration: 1 });
+			startNativeTool(chatUri, 'later-turn', 'later-call');
+			executingHost.executeTool(chatUri, 'receipt_tool', {}, source);
+
+			assert.deepStrictEqual(contexts, Array(7).fill(undefined));
+		});
+
+		test('rejects ambiguous native IDs without changing registered alias routing', () => {
+			manager.createSession(makeSummary());
+			const chatUri = buildDefaultChatUri(sessionResource);
+			startNativeTool(chatUri, 'first-turn', 'first-call', 'legacy_receipt_tool');
+			const contexts: Array<IServerToolExecutionContext['invocation']> = [];
+			const executingHost = receiptHost(context => { contexts.push(context.invocation); return 'legacy result'; });
+			const source = { toolCallId: 'first-call', toolName: 'legacy_receipt_tool' };
+			executingHost.executeTool(chatUri, 'legacy_receipt_tool', {}, source);
+			const parts = manager.getChatState(chatUri)!.activeTurn!.responseParts;
+			parts.push(parts[0]);
+			executingHost.executeTool(chatUri, 'legacy_receipt_tool', {}, source);
+
+			assert.deepStrictEqual(contexts, [{ toolCallId: 'first-call', turnId: 'first-turn' }, undefined]);
+		});
 
 		test('executeTool round-trips a comment into the annotation state', () => {
 			host.executeTool(buildDefaultChatUri(sessionResource), addCommentToolName, {

@@ -3,9 +3,9 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import type { IAgentServerToolDefinition, IAgentServerToolHost } from '../../common/agentServerTools.js';
+import type { IAgentServerToolDefinition, IAgentServerToolHost, IAgentServerToolInvocation } from '../../common/agentServerTools.js';
 import { ActionType } from '../../common/state/protocol/common/actions.js';
-import { parseRequiredSessionUriFromChatUri, type StringOrMarkdown, type ToolDefinition, type URI } from '../../common/state/sessionState.js';
+import { parseRequiredSessionUriFromChatUri, ResponsePartKind, ToolCallStatus, type StringOrMarkdown, type ToolDefinition, type URI } from '../../common/state/sessionState.js';
 import { createDecorator } from '../../../instantiation/common/instantiation.js';
 import type { AgentHostStateManager } from '../agentHostStateManager.js';
 
@@ -54,6 +54,11 @@ export interface IServerToolExecutionContext {
 	readonly sessionUri: URI;
 	readonly chatUri: URI;
 	readonly turnId?: string;
+	/** Exact running native call, captured before execution. Absent when callback identity cannot be verified. */
+	readonly invocation?: {
+		readonly toolCallId: string;
+		readonly turnId: string;
+	};
 }
 
 /**
@@ -244,7 +249,7 @@ export class AgentServerToolHost implements IAgentHostServerToolService {
 			?? false;
 	}
 
-	executeTool(chatUri: URI, toolName: string, rawArgs: unknown): string | Promise<string> {
+	executeTool(chatUri: URI, toolName: string, rawArgs: unknown, invocation?: IAgentServerToolInvocation): string | Promise<string> {
 		const group = this._groupByToolName.get(toolName);
 		if (!group) {
 			throw new Error(`Unknown server tool: ${toolName}`);
@@ -253,14 +258,27 @@ export class AgentServerToolHost implements IAgentHostServerToolService {
 		if (!this._isEnabledForSession(group, chatUri, name, toolName)) {
 			throw new Error(`Server tool "${toolName}" is disabled.`);
 		}
-		return group.execute(this._stateManager, this._executionContext(chatUri), name, rawArgs);
+		return group.execute(this._stateManager, this._executionContext(chatUri, invocation), name, rawArgs);
 	}
 
-	private _executionContext(chatUri: URI): IServerToolExecutionContext {
+	private _executionContext(chatUri: URI, invocation?: IAgentServerToolInvocation): IServerToolExecutionContext {
+		const activeTurn = this._stateManager.getChatState(chatUri)?.activeTurn;
+		const matches = invocation
+			&& typeof invocation.toolCallId === 'string' && invocation.toolCallId.length > 0
+			&& typeof invocation.toolName === 'string' && invocation.toolName.length > 0
+			? activeTurn?.responseParts.filter(part => part.kind === ResponsePartKind.ToolCall && part.toolCall.toolCallId === invocation.toolCallId)
+			: undefined;
+		const part = matches?.length === 1 ? matches[0] : undefined;
+		const verifiedInvocation = activeTurn && typeof activeTurn.id === 'string' && activeTurn.id.length > 0
+			&& part?.kind === ResponsePartKind.ToolCall
+			&& part.toolCall.status === ToolCallStatus.Running && part.toolCall.toolName === invocation?.toolName
+			? { toolCallId: part.toolCall.toolCallId, turnId: activeTurn.id }
+			: undefined;
 		return {
 			sessionUri: parseRequiredSessionUriFromChatUri(chatUri),
 			chatUri,
 			turnId: this._stateManager.getActiveTurnId(chatUri),
+			...(verifiedInvocation ? { invocation: verifiedInvocation } : {}),
 		};
 	}
 

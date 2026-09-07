@@ -2701,6 +2701,7 @@ export class CodexAgent extends Disposable implements IAgent {
 				if (!chatChannel) {
 					return { result: this._toolFailure(`No chat channel for server tool ${params.tool}`) };
 				}
+				const nativeToolCall = session.mapState.itemToToolCall.get(params.callId);
 				if (host.requiresConfirmation(chatChannel, params.tool)) {
 					const entry = session.mapState.itemToToolCall.get(params.callId);
 					if (!entry) {
@@ -2721,7 +2722,10 @@ export class CodexAgent extends Disposable implements IAgent {
 						return { result: this._toolFailure(`Server tool ${params.tool} was not approved`) };
 					}
 				}
-				const text = host.executeTool(chatChannel, params.tool, params.arguments);
+				const invocation = nativeToolCall?.toolName === params.tool && session.mapState.itemToToolCall.get(params.callId) === nativeToolCall
+					? { toolCallId: nativeToolCall.toolCallId, toolName: nativeToolCall.toolName }
+					: undefined;
+				const text = host.executeTool(chatChannel, params.tool, params.arguments, invocation);
 				return { result: { contentItems: [{ type: 'inputText', text: await text }], success: true } };
 			} catch (err) {
 				return { result: this._toolFailure(`Server tool ${params.tool} failed: ${err instanceof Error ? err.message : String(err)}`) };
